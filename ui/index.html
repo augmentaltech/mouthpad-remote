@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Remote Controller</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main>
+      <section class="card">
+        <div class="row">
+          <div>
+            <div class="label">USB CDC port</div>
+            <div id="device" class="value">Not connected</div>
+          </div>
+          <button id="connect">Connect</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="label">Forwarding</div>
+        <div class="row">
+          <div id="state" class="badge idle">Idle</div>
+          <div id="sent" class="muted"></div>
+        </div>
+        <p id="hint" class="muted"></p>
+      </section>
+
+      <section id="capture-error" class="card warn" hidden>
+        <p id="capture-error-text"></p>
+        <div class="row">
+          <button id="open-settings">Open Accessibility settings</button>
+          <button id="retry">Retry</button>
+        </div>
+      </section>
+
+      <p id="error" class="error"></p>
+      <p class="muted footer"><kbd>⌘</kbd><kbd>⇧</kbd><kbd>P</kbd> pauses / resumes forwarding</p>
+    </main>
+    <script src="main.js"></script>
+  </body>
+</html>
