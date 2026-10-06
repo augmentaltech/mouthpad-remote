@@ -7,6 +7,7 @@ mod hid;
 mod host_mouthpad;
 #[cfg(target_os = "macos")]
 mod keymap;
+mod keymap_web;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod keymap_windows;
 
@@ -29,6 +30,21 @@ fn disconnect(ctl: Ctl<'_>) {
 #[tauri::command]
 fn get_status(ctl: Ctl<'_>) -> Status {
     ctl.status()
+}
+
+#[tauri::command]
+fn web_key(ctl: Ctl<'_>, code: String, down: bool) {
+    ctl.forward_web_key(&code, down);
+}
+
+#[tauri::command]
+fn set_ios_autocorrect_guard(ctl: Ctl<'_>, enabled: bool) {
+    ctl.set_ios_autocorrect_guard(enabled);
+}
+
+#[tauri::command]
+fn toggle_pause(ctl: Ctl<'_>) {
+    ctl.toggle_pause();
 }
 
 #[tauri::command]
@@ -55,6 +71,9 @@ fn main() {
             connect,
             disconnect,
             get_status,
+            web_key,
+            toggle_pause,
+            set_ios_autocorrect_guard,
             retry_capture,
             open_accessibility_settings
         ])

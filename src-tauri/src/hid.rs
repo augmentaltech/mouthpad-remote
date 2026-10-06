@@ -1,5 +1,5 @@
 use mouthpad_proto::mouthware_message::{
-    hid_loopback, mouthware_message::MessageBody, ActionType, HidLoopback, KeystrokeType,
+    hid_loopback::Input, mouthware_message::MessageBody, ActionType, HidLoopback, KeystrokeType,
     MouseKeyboardAction, MouthwareMessage,
 };
 use prost::Message as _;
@@ -20,6 +20,24 @@ const WHEEL_DELTA_PER_SCROLL_TICK: f64 = 120.0;
 pub enum MouseButton {
     Left,
     Right,
+}
+
+/// What a physical key means to the HID keyboard report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAction {
+    /// A modifier's bit in the HID report's modifier byte.
+    Modifier(u8),
+    /// A HID keyboard usage.
+    Key(u8),
+}
+
+impl KeyAction {
+    pub fn event(self, down: bool) -> InputEvent {
+        match self {
+            KeyAction::Modifier(bit) => InputEvent::Modifier { bit, down },
+            KeyAction::Key(usage) => InputEvent::Key { usage, down },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,7 +105,7 @@ impl ScrollAccumulator {
     }
 }
 
-/// Turns host input transitions into HIDLoopback actions, tracking what the
+/// Turns host input transitions into HIDLoopback inputs, tracking what the
 /// device currently reports as held.
 ///
 /// The firmware's keyboard path only ORs modifiers into its held set
@@ -95,20 +113,29 @@ impl ScrollAccumulator {
 /// modifier while another stays down takes a clear followed by a re-hold.
 #[derive(Default)]
 pub struct HidTranslator {
+    /// Send characters that would accept an iOS autocorrect suggestion as text,
+    /// which the firmware types only after dismissing the suggestion.
+    pub ios_autocorrect_guard: bool,
     mods: u8,
     keys: Vec<u8>,
+    /// Keys held down whose character went out as text.
+    typed: Vec<u8>,
     device_mods: u8,
     left: bool,
     right: bool,
 }
 
 impl HidTranslator {
-    pub fn translate(&mut self, ev: InputEvent) -> Vec<MouseKeyboardAction> {
+    pub fn translate(&mut self, ev: InputEvent) -> Vec<Input> {
+        let actions = |actions: Vec<MouseKeyboardAction>| actions.into_iter().map(Input::KeyboardInput).collect();
         match ev {
-            InputEvent::MouseMove { dx, dy } => move_actions(dx, dy),
-            InputEvent::Scroll { vertical, horizontal } => scroll_actions(vertical, horizontal),
-            InputEvent::Button { button, down } => self.button(button, down).into_iter().collect(),
+            InputEvent::MouseMove { dx, dy } => actions(move_actions(dx, dy)),
+            InputEvent::Scroll { vertical, horizontal } => actions(scroll_actions(vertical, horizontal)),
+            InputEvent::Button { button, down } => actions(self.button(button, down).into_iter().collect()),
             InputEvent::Key { usage, down } => {
+                if let Some(out) = self.send_as_text(usage, down) {
+                    return out;
+                }
                 let changed = if down {
                     !self.keys.contains(&usage) && {
                         self.keys.push(usage);
@@ -120,7 +147,7 @@ impl HidTranslator {
                     self.keys.len() != before
                 };
                 if changed {
-                    self.keyboard_report()
+                    actions(self.keyboard_report())
                 } else {
                     vec![]
                 }
@@ -131,7 +158,7 @@ impl HidTranslator {
                     return vec![];
                 }
                 self.mods = mods;
-                self.keyboard_report()
+                actions(self.keyboard_report())
             }
             InputEvent::ReleaseAll => {
                 let mut out = Vec::new();
@@ -139,9 +166,10 @@ impl HidTranslator {
                 out.extend(self.button(MouseButton::Right, false));
                 self.mods = 0;
                 self.keys.clear();
+                self.typed.clear();
                 self.device_mods = 0;
                 out.push(keyboard_action(ActionType::AtClearKeystrokes, None, 0, &[]));
-                out
+                actions(out)
             }
         }
     }
@@ -183,6 +211,61 @@ impl HidTranslator {
         self.device_mods = self.mods;
         out
     }
+}
+
+impl HidTranslator {
+    /// Handles keys whose character goes to the firmware as text, returning
+    /// `None` for keys sent as ordinary key reports. Such a key's auto-repeat
+    /// and release send nothing.
+    fn send_as_text(&mut self, usage: u8, down: bool) -> Option<Vec<Input>> {
+        if self.typed.contains(&usage) {
+            if !down {
+                self.typed.retain(|&k| k != usage);
+            }
+            return Some(vec![]);
+        }
+        if !down || !self.ios_autocorrect_guard {
+            return None;
+        }
+        let character = autocorrect_trigger(usage, self.mods)?;
+        self.typed.push(usage);
+        let mut out = Vec::new();
+        // Held modifiers would apply to the keys the firmware types (Shift+Left
+        // selects text). The next key report restores them.
+        if self.device_mods != 0 {
+            let keys = &self.keys[..self.keys.len().min(MAX_KEYS_PER_REPORT)];
+            out.push(Input::KeyboardInput(keyboard_action(ActionType::AtClearKeystrokes, None, 0, keys)));
+            self.device_mods = 0;
+        }
+        out.push(Input::StringInput(character.to_string()));
+        Some(out)
+    }
+}
+
+/// The character a key types if it's one that makes iOS accept the pending
+/// autocorrect suggestion. Assumes a US layout on the host.
+fn autocorrect_trigger(usage: u8, mods: u8) -> Option<char> {
+    const SHIFT: u8 = 0x02 | 0x20;
+    if mods & !SHIFT != 0 {
+        return None;
+    }
+    let shift = mods & SHIFT != 0;
+    Some(match (usage, shift) {
+        (0x2C, _) => ' ',
+        (0x28 | 0x58, _) => '\n',    // enter, keypad enter
+        (0x2B, false) => '\t',       // Shift+Tab moves focus back instead
+        (0x37 | 0x63, false) => '.', // period, keypad period
+        (0x36, false) => ',',
+        (0x38, true) => '?',
+        (0x1E, true) => '!',
+        (0x33, true) => ':',
+        (0x27, true) => ')',
+        (0x30, false) => ']',
+        (0x30, true) => '}',
+        (0x34, false) => '\'',
+        (0x34, true) => '"',
+        _ => return None,
+    })
 }
 
 fn keyboard_action(
@@ -240,12 +323,10 @@ fn scroll_actions(mut vertical: i32, mut horizontal: i32) -> Vec<MouseKeyboardAc
     out
 }
 
-pub fn encode(action: MouseKeyboardAction, message_index: i32) -> Vec<u8> {
+pub fn encode(input: Input, message_index: i32) -> Vec<u8> {
     MouthwareMessage {
         message_index,
-        message_body: Some(MessageBody::HidLoopback(HidLoopback {
-            input: Some(hid_loopback::Input::KeyboardInput(action)),
-        })),
+        message_body: Some(MessageBody::HidLoopback(HidLoopback { input: Some(input) })),
     }
     .encode_to_vec()
 }
@@ -258,8 +339,18 @@ mod tests {
     const LSHIFT: u8 = 0x02;
     const KEY_C: u8 = 0x06;
 
-    fn summary(actions: &[MouseKeyboardAction]) -> Vec<(i32, Vec<i32>, Vec<i32>)> {
-        actions
+    fn keyboard(inputs: Vec<Input>) -> Vec<MouseKeyboardAction> {
+        inputs
+            .into_iter()
+            .map(|i| match i {
+                Input::KeyboardInput(a) => a,
+                Input::StringInput(s) => panic!("unexpected text {s:?}"),
+            })
+            .collect()
+    }
+
+    fn summary(inputs: &[Input]) -> Vec<(i32, Vec<i32>, Vec<i32>)> {
+        keyboard(inputs.to_vec())
             .iter()
             .map(|a| (a.action_type, a.modifier_keys.clone(), a.keycodes.clone()))
             .collect()
@@ -292,7 +383,7 @@ mod tests {
     #[test]
     fn hold_uses_keystroke_hold_so_firmware_sends_no_release() {
         let mut t = HidTranslator::default();
-        let a = t.translate(InputEvent::Key { usage: KEY_C, down: true });
+        let a = keyboard(t.translate(InputEvent::Key { usage: KEY_C, down: true }));
         assert_eq!(a[0].keystroke_type, Some(KeystrokeType::KeystrokeHold as i32));
     }
 
@@ -309,7 +400,7 @@ mod tests {
         let mut t = HidTranslator::default();
         let mut last = vec![];
         for usage in 4..12 {
-            last = t.translate(InputEvent::Key { usage, down: true });
+            last = keyboard(t.translate(InputEvent::Key { usage, down: true }));
         }
         assert_eq!(last[0].keycodes, vec![4, 5, 6, 7, 8, 9]);
     }
@@ -318,7 +409,7 @@ mod tests {
     fn button_release_without_press_is_dropped() {
         let mut t = HidTranslator::default();
         assert!(t.translate(InputEvent::Button { button: MouseButton::Left, down: false }).is_empty());
-        let press = t.translate(InputEvent::Button { button: MouseButton::Right, down: true });
+        let press = keyboard(t.translate(InputEvent::Button { button: MouseButton::Right, down: true }));
         assert_eq!(press[0].action_type, ActionType::AtRightButtonPress as i32);
     }
 
@@ -327,7 +418,7 @@ mod tests {
         let mut t = HidTranslator::default();
         t.translate(InputEvent::Button { button: MouseButton::Left, down: true });
         t.translate(InputEvent::Modifier { bit: LCMD, down: true });
-        let types: Vec<i32> = t.translate(InputEvent::ReleaseAll).iter().map(|a| a.action_type).collect();
+        let types: Vec<i32> = keyboard(t.translate(InputEvent::ReleaseAll)).iter().map(|a| a.action_type).collect();
         assert_eq!(types, vec![ActionType::AtLeftButtonRelease as i32, CLEAR]);
         assert_eq!(summary(&t.translate(InputEvent::Modifier { bit: LSHIFT, down: true })), vec![(HOLD, vec![2], vec![])]);
     }
@@ -352,6 +443,54 @@ mod tests {
     fn large_scrolls_split_into_signed_byte_reports() {
         let v: Vec<_> = scroll_actions(300, 0).iter().map(|a| a.vertical_scroll).collect();
         assert_eq!(v, vec![Some(127), Some(127), Some(46)]);
+    }
+
+    const KEY_SPACE: u8 = 0x2C;
+    const KEY_SLASH: u8 = 0x38;
+    const KEY_PERIOD: u8 = 0x37;
+    const KEY_A: u8 = 0x04;
+
+    fn guarded() -> HidTranslator {
+        HidTranslator { ios_autocorrect_guard: true, ..Default::default() }
+    }
+
+    fn text(c: &str) -> Input {
+        Input::StringInput(c.into())
+    }
+
+    #[test]
+    fn autocorrect_triggers_go_out_as_text_with_nothing_on_release() {
+        let mut t = guarded();
+        assert_eq!(t.translate(InputEvent::Key { usage: KEY_SPACE, down: true }), vec![text(" ")]);
+        assert!(t.translate(InputEvent::Key { usage: KEY_SPACE, down: true }).is_empty());
+        assert!(t.translate(InputEvent::Key { usage: KEY_SPACE, down: false }).is_empty());
+        assert_eq!(t.translate(InputEvent::Key { usage: KEY_PERIOD, down: true }), vec![text(".")]);
+    }
+
+    #[test]
+    fn autocorrect_trigger_text_goes_out_with_shift_released_and_shift_returns_after() {
+        let mut t = guarded();
+        t.translate(InputEvent::Modifier { bit: LSHIFT, down: true });
+        let out = t.translate(InputEvent::Key { usage: KEY_SLASH, down: true });
+        assert_eq!(summary(&out[..1]), vec![(CLEAR, vec![], vec![])]);
+        assert_eq!(out[1], text("?"));
+        t.translate(InputEvent::Key { usage: KEY_SLASH, down: false });
+        assert_eq!(summary(&t.translate(InputEvent::Key { usage: KEY_A, down: true })), vec![(HOLD, vec![2], vec![4])]);
+    }
+
+    #[test]
+    fn autocorrect_guard_leaves_shortcuts_non_triggers_and_off_state_as_keys() {
+        let mut t = guarded();
+        assert_eq!(summary(&t.translate(InputEvent::Key { usage: KEY_A, down: true })), vec![(HOLD, vec![], vec![4])]);
+        t.translate(InputEvent::Key { usage: KEY_A, down: false });
+        t.translate(InputEvent::Modifier { bit: LSHIFT, down: true });
+        // Shift+. is '>', not a trigger.
+        assert_eq!(summary(&t.translate(InputEvent::Key { usage: KEY_PERIOD, down: true })), vec![(HOLD, vec![2], vec![0x37])]);
+        t.translate(InputEvent::ReleaseAll);
+        t.translate(InputEvent::Modifier { bit: LCMD, down: true });
+        assert_eq!(summary(&t.translate(InputEvent::Key { usage: KEY_SPACE, down: true })), vec![(HOLD, vec![8], vec![0x2C])]);
+        let mut off = HidTranslator::default();
+        assert_eq!(summary(&off.translate(InputEvent::Key { usage: KEY_SPACE, down: true })), vec![(HOLD, vec![], vec![0x2C])]);
     }
 
     #[test]
@@ -395,12 +534,9 @@ mod tests {
     #[test]
     fn encodes_as_hid_loopback_keyboard_input() {
         let mut t = HidTranslator::default();
-        let action = t.translate(InputEvent::Key { usage: KEY_C, down: true }).remove(0);
-        let msg = MouthwareMessage::decode(encode(action.clone(), 7).as_slice()).unwrap();
+        let input = t.translate(InputEvent::Key { usage: KEY_C, down: true }).remove(0);
+        let msg = MouthwareMessage::decode(encode(input.clone(), 7).as_slice()).unwrap();
         assert_eq!(msg.message_index, 7);
-        assert_eq!(
-            msg.message_body,
-            Some(MessageBody::HidLoopback(HidLoopback { input: Some(hid_loopback::Input::KeyboardInput(action)) }))
-        );
+        assert_eq!(msg.message_body, Some(MessageBody::HidLoopback(HidLoopback { input: Some(input) })));
     }
 }

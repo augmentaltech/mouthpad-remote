@@ -1,16 +1,17 @@
 use crate::capture;
 use crate::cdc;
 use crate::hid::{self, HidTranslator, InputEvent};
+use crate::keymap_web;
 use log::{info, warn};
 use mouthpad_proto::mouthware_message::{
-    mouthpad_to_app_message::Uplink, mouthware_response::MessageBody as ResponseBody,
-    MouthpadToAppMessage,
+    mouthpad_to_app_message::Uplink, mouthware_message::MessageBody, mouthware_response::MessageBody as ResponseBody,
+    ConfigurableOptions, ConfigurableOptionsWrite, MouthpadToAppMessage, MouthwareMessage,
 };
 use prost::Message as _;
 use serde::Serialize;
 use serialport::SerialPort;
 use std::io::{ErrorKind, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -26,6 +27,7 @@ pub struct Status {
     engaged: bool,
     capture_error: Option<String>,
     last_error: Option<String>,
+    ios_autocorrect_guard: bool,
     messages_sent: u64,
     acked: u64,
     rejected: u64,
@@ -42,6 +44,7 @@ pub struct Controller {
     mouthpad_on_host: AtomicBool,
     capture_running: AtomicBool,
     engaged: AtomicBool,
+    ios_autocorrect_guard: AtomicBool,
     capture_error: Mutex<Option<String>>,
     last_error: Mutex<Option<String>>,
     port_name: Mutex<Option<String>>,
@@ -49,6 +52,7 @@ pub struct Controller {
     /// Bumped on every open so a reader thread from a previous connection
     /// can't tear down its successor.
     generation: AtomicU64,
+    message_index: AtomicI32,
     messages_sent: AtomicU64,
     acked: AtomicU64,
     rejected: AtomicU64,
@@ -66,11 +70,13 @@ impl Controller {
             mouthpad_on_host: AtomicBool::new(false),
             capture_running: AtomicBool::new(false),
             engaged: AtomicBool::new(false),
+            ios_autocorrect_guard: AtomicBool::new(true),
             capture_error: Mutex::new(None),
             last_error: Mutex::new(None),
             port_name: Mutex::new(None),
             port: Mutex::new(None),
             generation: AtomicU64::new(0),
+            message_index: AtomicI32::new(0),
             messages_sent: AtomicU64::new(0),
             acked: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -92,6 +98,26 @@ impl Controller {
 
     pub fn forward(&self, ev: InputEvent) {
         let _ = self.events.send(ev);
+    }
+
+    /// Keys the webview received, which happens when capture didn't swallow
+    /// them first (on Windows, whenever the webview has keyboard focus).
+    pub fn forward_web_key(&self, code: &str, down: bool) {
+        if !self.is_engaged() {
+            return;
+        }
+        if let Some(action) = keymap_web::classify(code) {
+            self.forward(action.event(down));
+        }
+    }
+
+    pub fn set_ios_autocorrect_guard(&self, enabled: bool) {
+        self.ios_autocorrect_guard.store(enabled, Ordering::SeqCst);
+        let _ = self.app.emit("status", self.status());
+    }
+
+    fn next_message_index(&self) -> i32 {
+        self.message_index.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
     }
 
     pub fn set_focused(&self, focused: bool) {
@@ -133,6 +159,7 @@ impl Controller {
             engaged: self.is_engaged(),
             capture_error: self.capture_error.lock().unwrap().clone(),
             last_error: self.last_error.lock().unwrap().clone(),
+            ios_autocorrect_guard: self.ios_autocorrect_guard.load(Ordering::SeqCst),
             messages_sent: self.messages_sent.load(Ordering::Relaxed),
             acked: self.acked.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
@@ -179,6 +206,10 @@ impl Controller {
         let reader = port.try_clone().map_err(|e| format!("cloning {path}: {e}"))?;
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         info!("opened proto CDC port {path}");
+        let mut port = port;
+        port.write_all(&cdc::frame(&self.tongue_control_message()))
+            .and_then(|()| port.flush())
+            .map_err(|e| format!("enabling tongue control on {path}: {e}"))?;
         *self.port.lock().unwrap() = Some(port);
         *self.port_name.lock().unwrap() = Some(path);
 
@@ -188,6 +219,22 @@ impl Controller {
             .spawn(move || this.drain_responses(reader, generation))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Puts the device in tongue cursor control. ConfigurableOptions persist on
+    /// the device, so this is sent on every connect in case something changed them.
+    fn tongue_control_message(&self) -> Vec<u8> {
+        MouthwareMessage {
+            message_index: self.next_message_index(),
+            message_body: Some(MessageBody::ConfigurableOptionsWrite(ConfigurableOptionsWrite {
+                options: Some(ConfigurableOptions {
+                    tongue_cursor_control: Some(true),
+                    head_cursor_control: Some(false),
+                    ..Default::default()
+                }),
+            })),
+        }
+        .encode_to_vec()
     }
 
     /// Reads device->host frames so the OS buffer never fills, tallies the
@@ -221,10 +268,20 @@ impl Controller {
         else {
             return;
         };
-        if !matches!(resp.message_body, Some(ResponseBody::HidLoopbackResponse(_))) {
-            return;
-        }
         let code = resp.request_result.map_or(0, |r| r.code);
+        match resp.message_body {
+            Some(ResponseBody::HidLoopbackResponse(_)) => {}
+            Some(ResponseBody::ConfigurableOptionsWriteResponse(write)) => {
+                if code == 0 {
+                    info!("device applied {:?}", write.options);
+                } else {
+                    warn!("device rejected the tongue control setting with error code {code}");
+                    self.set_error(Some(format!("Couldn't enable tongue control (error code {code})")));
+                }
+                return;
+            }
+            _ => return,
+        }
         if code == 0 {
             self.acked.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -256,17 +313,16 @@ impl Controller {
     /// behind a write are merged so latency can't grow with the backlog.
     pub fn run_writer(self: Arc<Self>, mut rx: UnboundedReceiver<InputEvent>) {
         let mut translator = HidTranslator::default();
-        let mut message_index: i32 = 0;
         while let Some(first) = rx.blocking_recv() {
             let mut batch = vec![first];
             while let Ok(ev) = rx.try_recv() {
                 batch.push(ev);
             }
+            translator.ios_autocorrect_guard = self.ios_autocorrect_guard.load(Ordering::SeqCst);
             let mut out = Vec::new();
             let mut count = 0;
-            for action in hid::coalesce(batch).into_iter().flat_map(|ev| translator.translate(ev)) {
-                message_index = message_index.wrapping_add(1);
-                out.extend(cdc::frame(&hid::encode(action, message_index)));
+            for input in hid::coalesce(batch).into_iter().flat_map(|ev| translator.translate(ev)) {
+                out.extend(cdc::frame(&hid::encode(input, self.next_message_index())));
                 count += 1;
             }
             if out.is_empty() {

@@ -31,6 +31,7 @@ function render(s) {
     ? `${s.messagesSent} sent · ${s.acked} acked${s.rejected ? ` · ${s.rejected} rejected` : ""}`
     : "";
 
+  $("ios-guard").checked = s.iosAutocorrectGuard;
   $("capture-error").hidden = !s.captureError;
   $("capture-error-text").textContent = s.captureError || "";
   $("error").textContent = s.lastError || "";
@@ -50,8 +51,33 @@ $("connect").addEventListener("click", async () => {
   }
   refresh();
 });
+$("ios-guard").addEventListener("change", (e) => invoke("set_ios_autocorrect_guard", { enabled: e.target.checked }));
 $("open-settings").addEventListener("click", () => invoke("open_accessibility_settings"));
 $("retry").addEventListener("click", async () => render((current = await invoke("retry_capture"))));
+
+// Keys only reach the page when capture didn't swallow them first (on Windows,
+// whenever the page has keyboard focus), so they're forwarded from here too.
+function isToggleChord(e) {
+  const command = isWindows ? e.ctrlKey && !e.metaKey : e.metaKey && !e.ctrlKey;
+  return e.code === "KeyP" && command && e.shiftKey && !e.altKey;
+}
+for (const type of ["keydown", "keyup"]) {
+  window.addEventListener(
+    type,
+    (e) => {
+      const down = type === "keydown";
+      if (isToggleChord(e)) {
+        e.preventDefault();
+        if (down && !e.repeat) invoke("toggle_pause");
+        return;
+      }
+      if (!current?.engaged) return;
+      e.preventDefault();
+      if (!(down && e.repeat)) invoke("web_key", { code: e.code, down });
+    },
+    true,
+  );
+}
 
 listen("status", (e) => render((current = e.payload)));
 refresh();

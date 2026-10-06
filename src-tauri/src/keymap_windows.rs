@@ -1,12 +1,6 @@
 //! Windows low-level keyboard hook codes to USB HID keyboard usages.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KeyAction {
-    /// A modifier's bit in the HID report's modifier byte.
-    Modifier(u8),
-    /// A HID keyboard usage.
-    Key(u8),
-}
+pub use crate::hid::KeyAction;
 
 /// The low-level hook reports left/right-specific virtual keys for modifiers.
 fn modifier_bit(vk: u32) -> Option<u8> {

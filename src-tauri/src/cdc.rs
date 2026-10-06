@@ -37,9 +37,12 @@ pub fn find_proto_port() -> Option<String> {
     names.into_iter().next()
 }
 
+/// The firmware doesn't take host data until DTR is asserted. macOS and Linux
+/// assert it on open; Windows leaves it off, so writes stall until they time out.
 pub fn open(path: &str) -> Result<Box<dyn SerialPort>, String> {
     serialport::new(path, BAUD)
         .timeout(Duration::from_millis(200))
+        .dtr_on_open(true)
         .open()
         .map_err(|e| format!("opening {path}: {e}"))
 }

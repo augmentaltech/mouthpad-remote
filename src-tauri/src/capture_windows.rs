@@ -6,14 +6,11 @@
 use super::*;
 use crate::hid::{InputEvent, MouseButton, ScrollAccumulator};
 use crate::keymap_windows::{self, KeyAction};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{Manager, PhysicalPosition};
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetCursorPos, GetMessageW, SetWindowsHookExW, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
     WH_KEYBOARD_LL, WH_MOUSE_LL,
@@ -42,6 +39,9 @@ const RECENTER_SETTLE: Duration = Duration::from_millis(100);
 struct HookState {
     controller: Arc<Controller>,
     swallow_toggle_key_up: AtomicBool,
+    /// HID modifier bits currently held. Tracked here because keys the hook
+    /// swallows never update GetAsyncKeyState.
+    modifiers: AtomicU8,
     scroll: Mutex<ScrollAccumulator>,
 }
 
@@ -56,6 +56,7 @@ pub fn start(controller: Arc<Controller>) -> Result<(), String> {
     STATE.get_or_init(|| HookState {
         controller,
         swallow_toggle_key_up: AtomicBool::new(false),
+        modifiers: AtomicU8::new(0),
         scroll: Mutex::default(),
     });
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -86,10 +87,12 @@ fn run_hooks(ready: std::sync::mpsc::Sender<Result<(), String>>) {
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {}
 }
 
-fn key_held(vk: VIRTUAL_KEY) -> bool { (unsafe { GetAsyncKeyState(vk.0 as i32) } as u16) & 0x8000 != 0 }
+const CTRL_BITS: u8 = 0x01 | 0x10;
+const SHIFT_BITS: u8 = 0x02 | 0x20;
+const ALT_OR_WIN_BITS: u8 = 0x04 | 0x40 | 0x08 | 0x80;
 
-fn is_toggle_chord() -> bool {
-    key_held(VK_CONTROL) && key_held(VK_SHIFT) && !key_held(VK_MENU) && !key_held(VK_LWIN) && !key_held(VK_RWIN)
+fn is_toggle_chord(modifiers: u8) -> bool {
+    modifiers & CTRL_BITS != 0 && modifiers & SHIFT_BITS != 0 && modifiers & ALT_OR_WIN_BITS == 0
 }
 
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -106,7 +109,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 
 /// Returns whether to swallow the event.
 fn handle_key(state: &HookState, message: u32, info: &KBDLLHOOKSTRUCT) -> bool {
-    if info.flags.0 & LLKHF_INJECTED != 0 || !state.controller.is_focused() {
+    if info.flags.0 & LLKHF_INJECTED != 0 {
         return false;
     }
     let down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
@@ -115,11 +118,23 @@ fn handle_key(state: &HookState, message: u32, info: &KBDLLHOOKSTRUCT) -> bool {
         return false;
     }
     let extended = info.flags.0 & LLKHF_EXTENDED != 0;
+    let action = keymap_windows::classify(info.vkCode, info.scanCode, extended);
+    // Tracked even while unfocused so a modifier held across a focus change counts.
+    if let Some(KeyAction::Modifier(bit)) = action {
+        if down {
+            state.modifiers.fetch_or(bit, Ordering::SeqCst);
+        } else {
+            state.modifiers.fetch_and(!bit, Ordering::SeqCst);
+        }
+    }
+    if !state.controller.is_focused() {
+        return false;
+    }
 
     // Ctrl+Shift+P toggles pause. Key repeat re-sends the down event, so only
     // the first down (before the matching up has been swallowed) toggles.
     if info.scanCode == SCAN_CODE_P && !extended {
-        if down && is_toggle_chord() {
+        if down && is_toggle_chord(state.modifiers.load(Ordering::SeqCst)) {
             if !state.swallow_toggle_key_up.swap(true, Ordering::SeqCst) {
                 state.controller.toggle_pause();
             }
@@ -133,10 +148,8 @@ fn handle_key(state: &HookState, message: u32, info: &KBDLLHOOKSTRUCT) -> bool {
     if !state.controller.is_engaged() {
         return false;
     }
-    match keymap_windows::classify(info.vkCode, info.scanCode, extended) {
-        Some(KeyAction::Modifier(bit)) => state.controller.forward(InputEvent::Modifier { bit, down }),
-        Some(KeyAction::Key(usage)) => state.controller.forward(InputEvent::Key { usage, down }),
-        None => {}
+    if let Some(action) = action {
+        state.controller.forward(action.event(down));
     }
     true
 }
