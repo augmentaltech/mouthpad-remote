@@ -1,20 +1,28 @@
 //! System-wide input capture. While the controller is engaged every mouse and
 //! keyboard event is forwarded to the device and swallowed locally, so
-//! shortcuts like ⌘Q or ⌘Tab reach the remote host instead of this Mac.
+//! shortcuts like ⌘Q/⌘Tab (macOS) or Alt+Tab/Win+E (Windows) reach the remote
+//! host instead of this computer.
 
 use crate::controller::Controller;
 use std::sync::Arc;
+use tauri::AppHandle;
 
 #[cfg(target_os = "macos")]
 pub use macos::{set_cursor_captured, start};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+#[path = "capture_windows.rs"]
+mod windows_capture;
+#[cfg(windows)]
+pub use windows_capture::{set_cursor_captured, start};
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn start(_controller: Arc<Controller>) -> Result<(), String> {
-    Err("Input capture is only implemented on macOS".into())
+    Err("Input capture is only implemented on macOS and Windows".into())
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn set_cursor_captured(_captured: bool) {}
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn set_cursor_captured(_app: &AppHandle, _captured: bool) {}
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -252,7 +260,7 @@ mod macos {
     /// Freezes and hides the local pointer while engaged; the tap still sees
     /// raw deltas because they are read from the event, not the cursor.
     /// Must run on the main thread.
-    pub fn set_cursor_captured(captured: bool) {
+    pub fn set_cursor_captured(_app: &AppHandle, captured: bool) {
         let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(!captured);
         let display = CGDisplay::main();
         let _ = if captured { display.hide_cursor() } else { display.show_cursor() };

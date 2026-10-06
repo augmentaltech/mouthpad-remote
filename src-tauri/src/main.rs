@@ -7,6 +7,8 @@ mod hid;
 mod host_mouthpad;
 #[cfg(target_os = "macos")]
 mod keymap;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod keymap_windows;
 
 use controller::{Controller, Status};
 use std::sync::Arc;

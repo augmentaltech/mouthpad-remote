@@ -151,7 +151,8 @@ impl Controller {
                 if !engage {
                     self.forward(InputEvent::ReleaseAll);
                 }
-                let _ = self.app.run_on_main_thread(move || capture::set_cursor_captured(engage));
+                let app = self.app.clone();
+                let _ = self.app.run_on_main_thread(move || capture::set_cursor_captured(&app, engage));
             }
         }
         let _ = self.app.emit("status", self.status());
@@ -247,7 +248,7 @@ impl Controller {
 
     pub fn shutdown(&self) {
         if self.engaged.swap(false, Ordering::SeqCst) {
-            capture::set_cursor_captured(false);
+            capture::set_cursor_captured(&self.app, false);
         }
     }
 

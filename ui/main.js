@@ -3,14 +3,18 @@ const { listen } = window.__TAURI__.event;
 
 const $ = (id) => document.getElementById(id);
 
+const isWindows = navigator.userAgent.includes("Windows");
+const SHORTCUT_TEXT = isWindows ? "Ctrl+Shift+P" : "⌘⇧P";
+$("shortcut").innerHTML = (isWindows ? ["Ctrl", "Shift", "P"] : ["⌘", "⇧", "P"]).map((k) => `<kbd>${k}</kbd>`).join("");
+
 function forwardingState(s) {
   if (!s.connected) return ["idle", "Not connected", "Plug in the MouthPad over USB and connect."];
   if (s.captureError) return ["idle", "Unavailable", "Input capture is not running."];
   if (s.mouthpadOnHost)
     return ["paused", "Paused", "A MouthPad is connected to this computer over Bluetooth, so input stays local."];
-  if (s.paused) return ["paused", "Paused", "Input stays on this computer. Press ⌘⇧P to resume."];
+  if (s.paused) return ["paused", "Paused", `Input stays on this computer. Press ${SHORTCUT_TEXT} to resume.`];
   if (!s.focused) return ["idle", "Waiting for focus", "Focus this window to forward input."];
-  return ["live", "Forwarding", "Mouse and keyboard go to the MouthPad. Press ⌘⇧P to pause."];
+  return ["live", "Forwarding", `Mouse and keyboard go to the MouthPad. Press ${SHORTCUT_TEXT} to pause.`];
 }
 
 function render(s) {

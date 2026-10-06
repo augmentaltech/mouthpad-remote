@@ -12,9 +12,11 @@ pub const MOUTHPAD_PRODUCT_ID: i32 = 0xEEEE;
 
 /// macOS may expose one paired MouthPad as several HID devices, so presence is
 /// tracked per device handle.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Default)]
 pub struct Presence(HashSet<usize>);
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl Presence {
     /// Returns whether any MouthPad is attached after the change.
     pub fn update(&mut self, device: usize, attached: bool) -> bool {
@@ -30,8 +32,44 @@ impl Presence {
 #[cfg(target_os = "macos")]
 pub use macos::start;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+pub use windows_watch::start;
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn start(_controller: Arc<Controller>) {}
+
+/// Windows has no cheap HID arrival callback without a window to receive it, so
+/// the HID device list is polled.
+#[cfg(windows)]
+mod windows_watch {
+    use super::*;
+    use std::time::Duration;
+
+    const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+    pub fn start(controller: Arc<Controller>) {
+        let spawned = std::thread::Builder::new().name("host-mouthpad".into()).spawn(move || {
+            let mut api = match hidapi::HidApi::new() {
+                Ok(api) => api,
+                Err(e) => {
+                    log::warn!("MouthPad host detection unavailable: {e}");
+                    return;
+                }
+            };
+            loop {
+                let present = api.refresh_devices().is_ok()
+                    && api.device_list().any(|d| {
+                        i32::from(d.vendor_id()) == MOUTHPAD_VENDOR_ID && i32::from(d.product_id()) == MOUTHPAD_PRODUCT_ID
+                    });
+                controller.set_mouthpad_on_host(present);
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        });
+        if let Err(e) = spawned {
+            log::warn!("could not start MouthPad host detection: {e}");
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod macos {

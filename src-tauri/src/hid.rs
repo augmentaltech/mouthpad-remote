@@ -9,9 +9,12 @@ const MAX_MOVE: i32 = 2047;
 const MAX_KEYS_PER_REPORT: usize = 6;
 /// The firmware sends wheel and pan as signed bytes.
 const MAX_SCROLL: i32 = 127;
-/// Trackpad scroll arrives as continuous pixel deltas; this many pixels make
-/// one wheel tick on the remote host.
+/// macOS trackpad scroll arrives as continuous pixel deltas; this many pixels
+/// make one wheel tick on the remote host.
 const PIXELS_PER_SCROLL_TICK: f64 = 12.0;
+/// Windows reports scroll in WHEEL_DELTA units, 120 per wheel notch; precision
+/// touchpads send fractions of a notch.
+const WHEEL_DELTA_PER_SCROLL_TICK: f64 = 120.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseButton {
@@ -54,8 +57,8 @@ pub fn coalesce(events: Vec<InputEvent>) -> Vec<InputEvent> {
     out
 }
 
-/// Turns continuous (trackpad) pixel deltas into whole wheel ticks, carrying
-/// the fractional remainder so slow scrolls still add up.
+/// Turns continuous scroll deltas into whole wheel ticks, carrying the
+/// fractional remainder so slow scrolls still add up.
 #[derive(Default)]
 pub struct ScrollAccumulator {
     vertical: f64,
@@ -64,12 +67,22 @@ pub struct ScrollAccumulator {
 
 impl ScrollAccumulator {
     pub fn add_pixels(&mut self, vertical: f64, horizontal: f64) -> Option<InputEvent> {
+        self.add(vertical, horizontal, PIXELS_PER_SCROLL_TICK)
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn add_wheel_delta(&mut self, vertical: f64, horizontal: f64) -> Option<InputEvent> {
+        self.add(vertical, horizontal, WHEEL_DELTA_PER_SCROLL_TICK)
+    }
+
+    /// Accumulates in the caller's own units so whole-unit inputs stay exact.
+    fn add(&mut self, vertical: f64, horizontal: f64, units_per_tick: f64) -> Option<InputEvent> {
         self.vertical += vertical;
         self.horizontal += horizontal;
-        let v = (self.vertical / PIXELS_PER_SCROLL_TICK).trunc();
-        let h = (self.horizontal / PIXELS_PER_SCROLL_TICK).trunc();
-        self.vertical -= v * PIXELS_PER_SCROLL_TICK;
-        self.horizontal -= h * PIXELS_PER_SCROLL_TICK;
+        let v = (self.vertical / units_per_tick).trunc();
+        let h = (self.horizontal / units_per_tick).trunc();
+        self.vertical -= v * units_per_tick;
+        self.horizontal -= h * units_per_tick;
         (v != 0.0 || h != 0.0).then_some(InputEvent::Scroll { vertical: v as i32, horizontal: h as i32 })
     }
 }
@@ -348,6 +361,14 @@ mod tests {
         assert_eq!(acc.add_pixels(8.0, 0.0), Some(InputEvent::Scroll { vertical: 1, horizontal: 0 }));
         assert_eq!(acc.add_pixels(11.0, 0.0), Some(InputEvent::Scroll { vertical: 1, horizontal: 0 }));
         assert_eq!(acc.add_pixels(-30.0, -24.0), Some(InputEvent::Scroll { vertical: -2, horizontal: -2 }));
+    }
+
+    #[test]
+    fn wheel_deltas_accumulate_at_120_per_notch() {
+        let mut acc = ScrollAccumulator::default();
+        assert_eq!(acc.add_wheel_delta(120.0, 0.0), Some(InputEvent::Scroll { vertical: 1, horizontal: 0 }));
+        assert_eq!(acc.add_wheel_delta(60.0, -40.0), None);
+        assert_eq!(acc.add_wheel_delta(60.0, -80.0), Some(InputEvent::Scroll { vertical: 1, horizontal: -1 }));
     }
 
     #[test]
