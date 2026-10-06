@@ -13,8 +13,12 @@ use serialport::SerialPort;
 use std::io::{ErrorKind, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+/// How often the reader checks for device replies.
+const READ_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -239,11 +243,23 @@ impl Controller {
 
     /// Reads device->host frames so the OS buffer never fills, tallies the
     /// device's verdict on each HIDLoopback, and notices unplugging.
+    ///
+    /// Only bytes already received are read. On Windows the reader and writer
+    /// share one synchronous file object, so a read left waiting for data would
+    /// hold up every write behind it.
     fn drain_responses(&self, mut reader: Box<dyn SerialPort>, generation: u64) {
         let mut buf = [0u8; 512];
         let mut accum = Vec::new();
         while self.generation.load(Ordering::SeqCst) == generation {
-            match reader.read(&mut buf) {
+            let result = reader
+                .bytes_to_read()
+                .map_err(std::io::Error::from)
+                .and_then(|available| match (available as usize).min(buf.len()) {
+                    0 => Ok(0),
+                    n => reader.read(&mut buf[..n]),
+                });
+            match result {
+                Ok(0) => std::thread::sleep(READ_POLL_INTERVAL),
                 Ok(n) => {
                     accum.extend_from_slice(&buf[..n]);
                     while let Some(payload) = cdc::next_frame(&mut accum) {
